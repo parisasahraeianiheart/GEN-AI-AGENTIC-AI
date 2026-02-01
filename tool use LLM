@@ -1,0 +1,41 @@
+from typing import Any, Dict, Callable
+
+# --- Tools ---
+def sql_query_tool(query: str) -> Dict[str, Any]:
+    # Placeholder: in real life you run DuckDB/BigQuery here
+    if "daily kpis" in query.lower():
+        return {"rows": [{"date": "2026-01-29", "suspicious_rate": 0.12, "success_rate": 0.86}]}
+    return {"rows": []}
+
+def retrieve_docs_tool(query: str) -> Dict[str, Any]:
+    # Placeholder for vector retrieval
+    return {"docs": ["runbook_login_spike", "metrics_definitions"]}
+
+TOOLS: Dict[str, Callable[..., Dict[str, Any]]] = {
+    "sql_query": sql_query_tool,
+    "retrieve_docs": retrieve_docs_tool,
+}
+
+# --- A simple rule-based “planner” (swap with an LLM planner in production) ---
+def plan(user_request: str):
+    steps = []
+    if "kpi" in user_request.lower() or "rate" in user_request.lower():
+        steps.append(("sql_query", {"query": "select * from analytics.mart_daily_kpis"}))
+    steps.append(("retrieve_docs", {"query": user_request}))
+    return steps
+
+def agent_run(user_request: str):
+    steps = plan(user_request)
+    results = []
+    for tool_name, args in steps:
+        tool = TOOLS[tool_name]
+        results.append((tool_name, tool(**args)))
+
+    # “Synthesis” step (LLM would do this in production)
+    return {
+        "request": user_request,
+        "tool_results": results,
+        "final": "I queried KPIs and retrieved runbook docs; next I would inspect IP reputation and VPN spikes and apply mitigations."
+    }
+
+print(agent_run("Explain the suspicious rate spike and show daily KPIs"))
