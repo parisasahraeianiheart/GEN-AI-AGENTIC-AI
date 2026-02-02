@@ -12,12 +12,7 @@ Dataset / table(s)
    ->
 Planner: exploration plan (EDA checklist)
    ->
-Tools:
-  - schema profiling (types, missingness)
-  - stats tests (corr, chi-square)
-  - anomaly detection (outliers, drift)
-  - visualization tool (plots)
-  - SQL/pandas execution sandbox
+Tools: 1-schema profiling (types, missingness), 2-stats tests (corr, chi-square), 3-anomaly detection (outliers, drift), 4-visualization tool (plots), 5-SQL/pandas execution sandbox
     ->
 Insight miner: findings + hypotheses
     ->
