@@ -1,9 +1,9 @@
+# src/agent.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
-import time
 import pandas as pd
 
 from src.tools import (
@@ -20,25 +20,32 @@ from src.tools import (
     plot_boxplots,
     plot_target_relationships,
 )
+from src.tools_drift import drift_psi, drift_ks
 from src.report import EDAReport
+from src.llm_planner import llm_plan
 
 
 @dataclass
 class AgentConfig:
     target: Optional[str] = None
-    task: str = "auto"  # "auto" | "classification" | "regression"
-    max_steps: int = 10
+    task: str = "auto"         # "auto" | "classification" | "regression"
+    max_steps: int = 12
     max_plots: int = 12
     plots_dir: str = "artifacts/plots"
-    top_k: int = 10
+    top_k: int = 10            # top-k features in MI / tests
+    enable_llm_planner: bool = True
+    enable_drift: bool = True
+    drift_alpha: float = 0.05
+    drift_bins: int = 10
 
 
 class AutonomousEDAAgent:
     """
-    A simple, deterministic "agentic" EDA:
-    - Plans a sequence of tool calls
-    - Executes them with a budget (steps + plots)
-    - Produces a structured report
+    Agentic EDA:
+      - Uses an LLM planner to propose a tool plan (JSON)
+      - Executes tool calls under budgets (max_steps, max_plots)
+      - Optionally runs drift/stability checks (PSI + KS) if baseline/current provided
+      - Produces a structured report with artifacts (tables, stats, plot paths)
     """
 
     def __init__(self, config: AgentConfig):
@@ -47,11 +54,26 @@ class AutonomousEDAAgent:
             "steps_used": 0,
             "plots_used": 0,
             "tool_log": [],
+            "plan_used": [],
         }
 
-    def _step(self, tool_name: str, result: ToolResult):
+        # Optional drift references (set via set_drift_data or by assigning attributes)
+        self.baseline_df: Optional[pd.DataFrame] = None
+        self.current_df: Optional[pd.DataFrame] = None
+
+    def set_drift_data(self, baseline_df: Optional[pd.DataFrame], current_df: Optional[pd.DataFrame]) -> None:
+        self.baseline_df = baseline_df
+        self.current_df = current_df
+
+    def _log_step(self, tool_name: str, summary: str) -> None:
         self.state["steps_used"] += 1
-        self.state["tool_log"].append({"tool": tool_name, "summary": result.summary})
+        self.state["tool_log"].append({"tool": tool_name, "summary": summary})
+
+    def _can_plot(self) -> bool:
+        return self.state["plots_used"] < self.cfg.max_plots
+
+    def _add_plots_used(self, n: int) -> None:
+        self.state["plots_used"] = min(self.cfg.max_plots, self.state["plots_used"] + n)
 
     def run(self, df: pd.DataFrame, dataset_name: str = "data") -> EDAReport:
         rep = EDAReport(
@@ -59,103 +81,209 @@ class AutonomousEDAAgent:
             dataset=dataset_name,
         )
 
-        # Identify columns
-        num_cols = df.select_dtypes(include="number").columns.tolist()
-        cat_cols = df.select_dtypes(exclude="number").columns.tolist()
+        # -------------------------
+        # Build small "brief" for planner (no raw data)
+        # -------------------------
+        schema_res = profile_schema(df)
+        schema_payload = schema_res.payload
 
-        # If target is provided, remove from feature lists
-        if self.cfg.target and self.cfg.target in num_cols:
-            num_cols = [c for c in num_cols if c != self.cfg.target]
-        if self.cfg.target and self.cfg.target in cat_cols:
-            cat_cols = [c for c in cat_cols if c != self.cfg.target]
+        top_missing = df.isna().mean().sort_values(ascending=False).head(8).index.tolist()
+        cat_cols_all = df.select_dtypes(exclude="number").columns.tolist()
+        top_card = (
+            df[cat_cols_all].nunique(dropna=False).sort_values(ascending=False).head(5).index.tolist()
+            if cat_cols_all else []
+        )
+
+        quick_stats = {
+            "top_missing": top_missing,
+            "top_cardinality": top_card,
+            "target": self.cfg.target,
+            "drift_available": bool(self.baseline_df is not None and self.current_df is not None),
+        }
 
         # -------------------------
-        # PLAN (fixed but agent-like)
+        # Create plan: LLM planner (preferred) or fallback deterministic plan
         # -------------------------
-        plan = ["profile_schema", "missingness", "duplicates"]
+        if self.cfg.enable_llm_planner:
+            try:
+                plan = llm_plan(
+                    schema=schema_payload,
+                    quick_stats=quick_stats,
+                    target=self.cfg.target,
+                    task=self.cfg.task,
+                    max_steps=self.cfg.max_steps,
+                )
+            except Exception as e:
+                # Fallback plan if planner fails
+                rep.add_anomaly(f"LLM planner failed; falling back to deterministic plan. Error: {e}")
+                plan = []
+        else:
+            plan = []
 
-        if num_cols:
-            plan += ["numeric_summary", "outlier_quantiles"]
-            if len(num_cols) >= 2:
-                plan += ["correlation_matrix"]
+        if not plan:
+            # Deterministic fallback plan (safe & strong)
+            plan = [
+                {"tool": "profile_schema", "args": {}},
+                {"tool": "missingness", "args": {"top_n": 20}},
+                {"tool": "duplicates", "args": {}},
+                {"tool": "numeric_summary", "args": {}},
+                {"tool": "outlier_quantiles", "args": {}},
+                {"tool": "correlation_matrix", "args": {}},
+                {"tool": "categorical_summary", "args": {}},
+            ]
+            if self.cfg.target:
+                plan.append({"tool": "target_relationships", "args": {}})
+                plan.append({"tool": "plot_target_relationships", "args": {}})
+            plan += [
+                {"tool": "plot_distributions", "args": {}},
+                {"tool": "plot_boxplots", "args": {}},
+            ]
+            if self.cfg.enable_drift and self.baseline_df is not None and self.current_df is not None:
+                plan += [
+                    {"tool": "drift_psi", "args": {"top_k": 10, "n_bins": self.cfg.drift_bins}},
+                    {"tool": "drift_ks", "args": {"alpha": self.cfg.drift_alpha, "top_k": 10}},
+                ]
 
-        if cat_cols:
-            plan += ["categorical_summary"]
-
-        if self.cfg.target:
-            plan += ["target_relationships"]
-
-        # Add plot tasks at the end (budgeted)
-        plan += ["plot_distributions", "plot_boxplots"]
-        if self.cfg.target:
-            plan += ["plot_target_relationships"]
+        # Keep within max steps
+        plan = plan[: self.cfg.max_steps]
+        self.state["plan_used"] = plan
 
         # -------------------------
-        # EXECUTE with budget
+        # Tool router (dispatcher)
         # -------------------------
-        for task_name in plan:
+        def _num_cols_no_target() -> List[str]:
+            cols = df.select_dtypes(include="number").columns.tolist()
+            if self.cfg.target and self.cfg.target in cols:
+                cols = [c for c in cols if c != self.cfg.target]
+            return cols
+
+        def _cat_cols_no_target() -> List[str]:
+            cols = df.select_dtypes(exclude="number").columns.tolist()
+            if self.cfg.target and self.cfg.target in cols:
+                cols = [c for c in cols if c != self.cfg.target]
+            return cols
+
+        TOOL_ROUTER = {
+            "profile_schema": lambda **kwargs: profile_schema(df),
+            "missingness": lambda top_n=20, **kwargs: missingness(df, top_n=top_n),
+            "duplicates": lambda **kwargs: duplicates(df),
+            "numeric_summary": lambda **kwargs: numeric_summary(df, _num_cols_no_target()),
+            "categorical_summary": lambda top_n=10, **kwargs: categorical_summary(df, _cat_cols_no_target(), top_n=top_n),
+            "correlation_matrix": lambda **kwargs: correlation_matrix(df, _num_cols_no_target()),
+            "outlier_quantiles": lambda qs=(0.01, 0.99), **kwargs: outlier_quantiles(df, _num_cols_no_target(), qs=qs),
+            "target_relationships": lambda **kwargs: target_relationships(
+                df=df,
+                target=self.cfg.target,
+                num_cols=_num_cols_no_target(),
+                cat_cols=_cat_cols_no_target(),
+                task=self.cfg.task,
+                top_k=self.cfg.top_k,
+            ),
+            "plot_distributions": lambda max_plots=6, **kwargs: plot_distributions(
+                df, df.select_dtypes(include="number").columns.tolist(), self.cfg.plots_dir, max_plots=max_plots
+            ),
+            "plot_boxplots": lambda max_plots=6, **kwargs: plot_boxplots(
+                df, df.select_dtypes(include="number").columns.tolist(), self.cfg.plots_dir, max_plots=max_plots
+            ),
+            "plot_target_relationships": lambda max_plots=6, **kwargs: plot_target_relationships(
+                df, self.cfg.target, _num_cols_no_target(), self.cfg.plots_dir, max_plots=max_plots
+            ),
+            # Drift tools (require baseline/current)
+            "drift_psi": lambda top_k=10, n_bins=10, **kwargs: drift_psi(
+                df_baseline=self.baseline_df,
+                df_current=self.current_df,
+                top_k=top_k,
+                n_bins=n_bins,
+            ),
+            "drift_ks": lambda alpha=0.05, top_k=10, **kwargs: drift_ks(
+                df_baseline=self.baseline_df,
+                df_current=self.current_df,
+                alpha=alpha,
+                top_k=top_k,
+            ),
+        }
+
+        # -------------------------
+        # Execute plan with budgets
+        # -------------------------
+        for step in plan:
             if self.state["steps_used"] >= self.cfg.max_steps:
                 rep.add_anomaly(f"Stopped early: reached max_steps={self.cfg.max_steps}.")
                 break
 
-            if task_name == "profile_schema":
-                r = profile_schema(df); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                rep.artifacts["schema"] = r.payload
+            tool = step.get("tool")
+            args = step.get("args", {}) or {}
 
-            elif task_name == "missingness":
-                r = missingness(df); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                rep.artifacts["missingness_top"] = r.payload.get("missing_table_top")
+            if tool not in TOOL_ROUTER:
+                rep.add_anomaly(f"Planner requested unknown tool '{tool}'. Skipped.")
+                continue
 
-                # Flag high missing columns
-                miss_tbl = r.payload.get("missing_table_top")
+            # Plot budget checks
+            if tool in ("plot_distributions", "plot_boxplots", "plot_target_relationships") and not self._can_plot():
+                continue
+            if tool == "plot_target_relationships" and not self.cfg.target:
+                continue
+
+            # Drift availability checks
+            if tool in ("drift_psi", "drift_ks"):
+                if not self.cfg.enable_drift:
+                    continue
+                if self.baseline_df is None or self.current_df is None:
+                    rep.add_anomaly("Drift requested but baseline/current data not provided. Skipped.")
+                    continue
+
+            # Execute tool
+            try:
+                result: ToolResult = TOOL_ROUTER[tool](**args)
+            except TypeError:
+                # Planner may pass args that a tool doesn't accept; retry without args
+                result = TOOL_ROUTER[tool]()
+            except Exception as e:
+                rep.add_anomaly(f"Tool '{tool}' failed: {e}")
+                continue
+
+            self._log_step(tool, result.summary)
+            rep.add_finding(f"[{tool}] {result.summary}")
+
+            # Store artifacts
+            rep.artifacts.setdefault("tool_outputs", {})
+            rep.artifacts["tool_outputs"][tool] = result.payload
+
+            # Track plot usage
+            if tool in ("plot_distributions", "plot_boxplots", "plot_target_relationships"):
+                paths = (result.payload or {}).get("paths", [])
+                rep.artifacts.setdefault("plots", [])
+                rep.artifacts["plots"].extend(paths)
+                self._add_plots_used(len(paths))
+
+            # Add “smart” interpretations for a few tools (helps interview polish)
+            if tool == "missingness":
+                miss_tbl = (result.payload or {}).get("missing_table_top")
                 if miss_tbl is not None and len(miss_tbl) > 0:
                     high = miss_tbl[miss_tbl["missing_rate"] >= 0.30]
                     if len(high) > 0:
-                        rep.add_anomaly(f"{len(high)} columns have >=30% missingness: {', '.join(high.index.tolist()[:6])}")
+                        rep.add_anomaly(
+                            f"{len(high)} columns have >=30% missingness: {', '.join(high.index.tolist()[:6])}"
+                        )
+                        rep.add_next_step("Decide missing-value strategy: drop, impute, or model missingness explicitly.")
 
-            elif task_name == "duplicates":
-                r = duplicates(df); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                if r.payload.get("duplicate_rows", 0) > 0:
-                    rep.add_anomaly("Dataset contains duplicate rows; consider deduplication rules.")
-
-            elif task_name == "numeric_summary":
-                r = numeric_summary(df, num_cols); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                rep.artifacts["numeric_describe"] = r.payload.get("describe")
-                rep.artifacts["skew_top"] = r.payload.get("skew")
-                rep.artifacts["kurtosis_top"] = r.payload.get("kurtosis")
-
-                # Flag heavy skew / heavy tails
-                skew = r.payload.get("skew")
-                kurt = r.payload.get("kurtosis")
+            if tool == "numeric_summary":
+                skew = (result.payload or {}).get("skew")
+                kurt = (result.payload or {}).get("kurtosis")
                 if skew is not None and len(skew) > 0:
                     bad = skew[skew.abs() > 2].head(5)
                     if len(bad) > 0:
                         rep.add_anomaly(f"Heavy skew detected (|skew|>2) in: {', '.join(bad.index.tolist())}")
-                        rep.add_next_step("Consider log/Box-Cox/Yeo-Johnson transforms for heavily skewed variables.")
+                        rep.add_next_step("Consider log/PowerTransformer for heavily skewed variables.")
                 if kurt is not None and len(kurt) > 0:
                     bad = kurt[kurt > 10].head(5)
                     if len(bad) > 0:
-                        rep.add_anomaly(f"Heavy tails / outliers suggested (kurtosis>10) in: {', '.join(bad.index.tolist())}")
-                        rep.add_next_step("Consider RobustScaler, winsorization, or outlier handling for heavy-tailed variables.")
+                        rep.add_anomaly(f"Heavy tails suggested (kurtosis>10) in: {', '.join(bad.index.tolist())}")
+                        rep.add_next_step("Consider RobustScaler or outlier handling for heavy-tailed variables.")
 
-            elif task_name == "outlier_quantiles":
-                r = outlier_quantiles(df, num_cols); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                rep.artifacts["outlier_quantiles"] = r.payload.get("quantiles")
-
-            elif task_name == "correlation_matrix":
-                r = correlation_matrix(df, num_cols); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                corr = r.payload.get("corr")
-                rep.artifacts["corr"] = corr
-
-                # Flag highly correlated pairs
-                if corr is not None:
-                    # quick scan for large |corr| off-diagonal
+            if tool == "correlation_matrix":
+                corr = (result.payload or {}).get("corr")
+                if corr is not None and hasattr(corr, "columns"):
                     pairs = []
                     cols = corr.columns.tolist()
                     for i in range(len(cols)):
@@ -164,84 +292,63 @@ class AutonomousEDAAgent:
                             if abs(val) >= 0.85:
                                 pairs.append((cols[i], cols[j], float(val)))
                     if pairs:
-                        rep.add_anomaly(f"High correlation (|r|>=0.85) pairs found: {', '.join([f'{a}-{b}({v:.2f})' for a,b,v in pairs[:5]])}")
-                        rep.add_next_step("Consider dropping one of correlated features or applying dimension reduction.")
+                        rep.add_anomaly(
+                            "High correlation (|r|>=0.85) pairs: "
+                            + ", ".join([f"{a}-{b}({v:.2f})" for a, b, v in pairs[:5]])
+                        )
+                        rep.add_next_step("Consider dropping correlated features or using dimension reduction.")
 
-            elif task_name == "categorical_summary":
-                r = categorical_summary(df, cat_cols); self._step(task_name, r)
-                rep.add_finding(r.summary)
-                nunique = r.payload.get("nunique")
-                rep.artifacts["categorical_nunique"] = nunique
-
-                # Flag high-cardinality
+            if tool == "categorical_summary":
+                nunique = (result.payload or {}).get("nunique")
                 if nunique is not None and len(nunique) > 0:
                     high = nunique[nunique > 50].head(5)
                     if len(high) > 0:
-                        rep.add_anomaly(f"High-cardinality categorical features (>50 unique): {', '.join(high.index.tolist())}")
-                        rep.add_next_step("Consider frequency encoding or target encoding for high-cardinality categoricals.")
+                        rep.add_anomaly(f"High-cardinality categoricals (>50 unique): {', '.join(high.index.tolist())}")
+                        rep.add_next_step("Use frequency encoding or target encoding for high-cardinality categoricals.")
 
-            elif task_name == "target_relationships":
-                r = target_relationships(
-                    df=df,
-                    target=self.cfg.target,
-                    num_cols=[c for c in df.select_dtypes(include="number").columns if c != self.cfg.target],
-                    cat_cols=[c for c in df.select_dtypes(exclude="number").columns if c != self.cfg.target],
-                    task=self.cfg.task,
-                    top_k=self.cfg.top_k,
-                )
-                self._step(task_name, r)
-                rep.add_finding(r.summary)
-                rep.artifacts["target_relationships"] = r.payload
+            if tool == "target_relationships":
+                payload = result.payload or {}
+                task_used = payload.get("task", "auto")
+                rep.add_hypothesis(f"Task inferred: {task_used} based on target distribution.")
+                mi = payload.get("mutual_info_top")
+                if mi is not None and hasattr(mi, "index") and len(mi) > 0:
+                    rep.add_hypothesis(f"Top MI features (potential signal): {', '.join(list(mi.index[:5]))}")
+                rep.add_next_step("Start with a simple baseline model; then compare with stronger non-linear models if needed.")
 
-                task_used = r.payload.get("task", "auto")
-                rep.add_hypothesis(f"Task likely: {task_used} based on target distribution.")
+            if tool == "drift_psi":
+                top = (result.payload or {}).get("top")
+                if top is not None and len(top) > 0:
+                    # PSI rule-of-thumb
+                    max_feat = top.iloc[0]["feature"]
+                    max_psi = float(top.iloc[0]["psi"])
+                    if max_psi > 0.25:
+                        rep.add_anomaly(f"Major drift detected by PSI: {max_feat} PSI={max_psi:.3f} (>0.25).")
+                        rep.add_next_step("Investigate drift source; consider retraining or feature review.")
+                    elif max_psi > 0.10:
+                        rep.add_anomaly(f"Moderate drift detected by PSI: {max_feat} PSI={max_psi:.3f} (0.10–0.25).")
 
-                mi = r.payload.get("mutual_info_top")
-                if mi is not None and len(mi) > 0:
-                    rep.add_hypothesis(f"Top MI features (potentially predictive): {', '.join(list(mi.index[:5]))}")
+            if tool == "drift_ks":
+                ks_tbl = (result.payload or {}).get("ks_table")
+                alpha = (result.payload or {}).get("alpha", self.cfg.drift_alpha)
+                if ks_tbl is not None and "significant" in ks_tbl.columns:
+                    sig = int(ks_tbl["significant"].sum())
+                    if sig > 0:
+                        rep.add_anomaly(f"KS drift: {sig} numeric features shifted significantly (p<{alpha}).")
+                        rep.add_next_step("If shifts impact model performance, recalibrate thresholds or retrain.")
 
-                rep.add_next_step("Use cross-validation and evaluate baseline models; start with simple models before complex ones.")
-
-            elif task_name == "plot_distributions":
-                if self.state["plots_used"] >= self.cfg.max_plots:
-                    continue
-                r = plot_distributions(df, df.select_dtypes(include="number").columns.tolist(), self.cfg.plots_dir, max_plots=6)
-                self._step(task_name, r)
-                paths = r.payload.get("paths", [])
-                self.state["plots_used"] += len(paths)
-                rep.artifacts.setdefault("plots", []).extend(paths)
-
-            elif task_name == "plot_boxplots":
-                if self.state["plots_used"] >= self.cfg.max_plots:
-                    continue
-                r = plot_boxplots(df, df.select_dtypes(include="number").columns.tolist(), self.cfg.plots_dir, max_plots=6)
-                self._step(task_name, r)
-                paths = r.payload.get("paths", [])
-                self.state["plots_used"] += len(paths)
-                rep.artifacts.setdefault("plots", []).extend(paths)
-
-            elif task_name == "plot_target_relationships":
-                if not self.cfg.target or self.state["plots_used"] >= self.cfg.max_plots:
-                    continue
-                num_all = df.select_dtypes(include="number").columns.tolist()
-                num_all = [c for c in num_all if c != self.cfg.target]
-                r = plot_target_relationships(df, self.cfg.target, num_all, self.cfg.plots_dir, max_plots=6)
-                self._step(task_name, r)
-                paths = r.payload.get("paths", [])
-                self.state["plots_used"] += len(paths)
-                rep.artifacts.setdefault("plots", []).extend(paths)
-
-        # Final summary
+        # -------------------------
+        # Wrap up: attach agent state & defaults
+        # -------------------------
         rep.artifacts["agent_state"] = {
             "steps_used": self.state["steps_used"],
             "plots_used": self.state["plots_used"],
             "tool_log": self.state["tool_log"],
+            "plan_used": self.state["plan_used"],
         }
 
-        # Add final “next steps” if empty
         if not rep.next_steps:
-            rep.add_next_step("Define target variable and objective (classification vs regression).")
-            rep.add_next_step("Decide missing value strategy and encode categoricals appropriately.")
-            rep.add_next_step("Train a baseline model and evaluate with appropriate metrics.")
+            rep.add_next_step("Confirm objective (classification vs regression) and define target precisely.")
+            rep.add_next_step("Choose missing-value strategy and encoding/scaling approach.")
+            rep.add_next_step("Train baseline model and evaluate with appropriate metrics.")
 
         return rep
